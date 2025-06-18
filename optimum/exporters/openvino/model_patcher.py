@@ -6248,3 +6248,65 @@ class Llama4TextModelPatcher(ModelPatcher):
             if layer.is_moe_layer:
                 layer.feed_forward.forward = layer.feed_forward._orig_forward
             layer.self_attn.forward = layer.self_attn._orig_forward
+
+# modified from https://github.com/huggingface/transformers/blob/v4.51.0/src/transformers/models/git/modeling_git.py#L1197
+# Patch aten::fill with broadcasted bool false value to fix tracing failure
+def git_create_attention_mask(self, tgt, memory, tgt_mask, past_key_values_length, memory_key_padding_mask=None):
+    num_tgt = tgt.shape[1]
+    num_memory = memory.shape[1]
+    device = tgt.device
+    dtype = tgt.dtype
+    top_left = torch.zeros((num_memory, num_memory), device=device, dtype=dtype)
+    top_right = torch.full(
+        (num_memory, num_tgt + past_key_values_length),
+        float("-inf"),
+        device=tgt.device,
+        dtype=dtype,
+    )
+    bottom_left = torch.zeros(
+        (num_tgt, num_memory),
+        dtype=dtype,
+        device=tgt_mask.device,
+    )
+
+    if past_key_values_length > 0:
+        tgt_mask = torch.zeros(
+            (tgt_mask.shape[0], tgt_mask.shape[0] + past_key_values_length),
+            dtype=dtype,
+            device=tgt_mask.device,
+        )
+
+    left = torch.cat((top_left, bottom_left), dim=0)
+    right = torch.cat((top_right, tgt_mask.to(dtype)), dim=0)
+
+    full_attention_mask = torch.cat((left, right), dim=1)[None, :]
+
+    if memory_key_padding_mask is None:
+        memory_key_padding_mask = torch.tensor([False], device=device, dtype=torch.bool).repeat((memory.shape[0], memory.shape[1]))
+    # if it is False, it means valid. That is, it is not a padding
+    if memory_key_padding_mask.dtype != torch.bool:
+        raise ValueError("Memory key padding mask must be a boolean tensor.")
+    zero_negative_infinity = torch.zeros_like(memory_key_padding_mask, dtype=tgt.dtype)
+    zero_negative_infinity[memory_key_padding_mask] = float("-inf")
+    full_attention_mask = full_attention_mask.expand(
+        (memory_key_padding_mask.shape[0], num_memory + num_tgt, num_memory + past_key_values_length + num_tgt)
+    )
+    full_attention_mask = full_attention_mask.clone()
+    origin_left = full_attention_mask[:, :, :num_memory]
+    update = zero_negative_infinity[:, None, :]
+    full_attention_mask[:, :, :num_memory] = origin_left + update
+
+    # add axis for multi-head
+    full_attention_mask = full_attention_mask[:, None, :, :]
+
+    return full_attention_mask
+
+class GITModelPatcher(ModelPatcher):
+    def __enter__(self):
+        super().__enter__()
+        self._model.git._orig_create_attention_mask = self._model.git.create_attention_mask
+        self._model.git.create_attention_mask = types.MethodType(git_create_attention_mask, self._model.git)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        self._model.git.create_attention_mask = self._model.git._orig_create_attention_mask

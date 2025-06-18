@@ -21,7 +21,7 @@ from transformers import AutoConfig, PretrainedConfig, PreTrainedModel, TFPreTra
 from transformers.utils import is_tf_available
 
 from optimum.exporters.onnx.base import ConfigBehavior
-from optimum.exporters.onnx.config import OnnxConfig, TextDecoderOnnxConfig, TextDecoderWithPositionIdsOnnxConfig
+from optimum.exporters.onnx.config import OnnxConfig, TextDecoderOnnxConfig, TextDecoderWithPositionIdsOnnxConfig, TextAndVisionOnnxConfig
 from optimum.exporters.onnx.model_configs import (
     BlenderbotOnnxConfig,
     BlenderbotSmallOnnxConfig,
@@ -68,7 +68,7 @@ from optimum.utils.input_generators import (
     GemmaDummyPastKeyValuesGenerator,
     MistralDummyPastKeyValuesGenerator,
 )
-from optimum.utils.normalized_config import NormalizedConfig, NormalizedTextConfig, NormalizedVisionConfig
+from optimum.utils.normalized_config import NormalizedConfig, NormalizedTextConfig, NormalizedVisionConfig, NormalizedTextAndVisionConfig
 
 from ...intel.utils.import_utils import (
     _transformers_version,
@@ -93,6 +93,7 @@ from .model_patcher import (
     FluxTransfromerModelPatcher,
     Gemma2ModelPatcher,
     Gemma3LMModelPatcher,
+    GITModelPatcher,
     GptBigCodeModelPatcher,
     GptJModelPatcher,
     GptNeoModelPatcher,
@@ -194,6 +195,10 @@ def init_model_configs():
         "AutoModelForCausalLM",
     )
     TasksManager._CUSTOM_CLASSES[("pt", "llama4", "image-text-to-text")] = (
+        "transformers",
+        "AutoModelForImageTextToText",
+    )
+    TasksManager._CUSTOM_CLASSES[("pt", "git", "image-text-to-text")] = (
         "transformers",
         "AutoModelForImageTextToText",
     )
@@ -4201,3 +4206,24 @@ class Llama4OpenVINOConfig(GotOCR2OpenVINOConfig):
         if self._behavior != VLMConfigBehavior.VISION_EMBEDDINGS:
             return super().patch_model_for_export(model, model_kwargs)
         return Llama4ImageEmbeddingsModelPatcher(self, model, model_kwargs)
+
+@register_in_tasks_manager(
+    "git", *["image-text-to-text", "image-to-text"], library_name="transformers"
+)
+class GitOpenVINOConfig(TextAndVisionOnnxConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedTextAndVisionConfig.with_args(vision_config="vision_config")
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, DummyVisionInputGenerator,)
+    MIN_TRANSFORMERS_VERSION = "4.51.0"
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {
+            "input_ids": {0: "batch_size", 1: "sequence_length"},
+            "pixel_values": {0: "image_batch_size", 1: "num_channels", 2: "height", 3: "width"},
+        }
+
+    def patch_model_for_export(
+        self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
+    ):
+        model_kwargs = model_kwargs or {}
+        return GITModelPatcher(self, model, model_kwargs)
