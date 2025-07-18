@@ -849,6 +849,8 @@ class OVModelForCausalLM(OVBaseDecoderModel, GenerationMixin):
             init_cls = OVBloomForCausalLM
         elif model_type == "gpt-bigcode":
             init_cls = OVGPTBigCodeForCausalLM
+        elif model_type == "git":
+            init_cls = OVGitForCausalLM
         else:
             init_cls = cls
 
@@ -1026,3 +1028,57 @@ class OVGPTBigCodeForCausalLM(OVModelForCausalLM):
             return past_key_values
         else:
             return tuple(np.take(layer_past, beam_idx, 0) for layer_past in past_key_values)
+
+class OVGitForCausalLM(OVModelForCausalLM):
+    export_feature = "image-to-text"
+
+    def prepare_inputs(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ) -> Dict:
+        inputs = super().prepare_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            **kwargs,
+        )
+
+        if pixel_values is not None:
+            inputs["pixel_values"] = pixel_values.cpu().numpy()
+
+        return inputs
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ) -> CausalLMOutputWithPast:
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            token_type_ids=token_type_ids,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, pixel_values=None, **kwargs):
+        model_inputs = super().prepare_inputs_for_generation(input_ids, past_key_values, **kwargs)
+        if pixel_values is not None and past_key_values is None:
+            model_inputs["pixel_values"] = pixel_values
+        elif past_key_values is not None:
+            model_inputs.pop("pixel_values", None)
+            
+        return model_inputs

@@ -72,7 +72,7 @@ from .modeling import (
     OVModelForTokenClassification,
     OVModelForZeroShotImageClassification,
 )
-from .modeling_decoder import OVModelForCausalLM
+from .modeling_decoder import OVModelForCausalLM, OVGitForCausalLM
 from .modeling_open_clip import (
     OVModelOpenCLIPForZeroShotImageClassification,
     OVModelOpenCLIPText,

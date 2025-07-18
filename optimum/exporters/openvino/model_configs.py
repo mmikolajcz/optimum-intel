@@ -4208,7 +4208,7 @@ class Llama4OpenVINOConfig(GotOCR2OpenVINOConfig):
         return Llama4ImageEmbeddingsModelPatcher(self, model, model_kwargs)
 
 @register_in_tasks_manager(
-    "git", *["image-text-to-text", "image-to-text"], library_name="transformers"
+    "git", *["image-to-text"], library_name="transformers"
 )
 class GitOpenVINOConfig(TextAndVisionOnnxConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedTextAndVisionConfig.with_args(vision_config="vision_config")
@@ -4221,6 +4221,10 @@ class GitOpenVINOConfig(TextAndVisionOnnxConfig):
             "input_ids": {0: "batch_size", 1: "sequence_length"},
             "pixel_values": {0: "image_batch_size", 1: "num_channels", 2: "height", 3: "width"},
         }
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {"logits": {0: "batch_size", 1: "sequence_length"}}
 
     def patch_model_for_export(
         self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
