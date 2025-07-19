@@ -4208,26 +4208,118 @@ class Llama4OpenVINOConfig(GotOCR2OpenVINOConfig):
         return Llama4ImageEmbeddingsModelPatcher(self, model, model_kwargs)
 
 @register_in_tasks_manager(
-    "git", *["image-to-text"], library_name="transformers"
+    "git", *["image-text-to-text", "image-to-text"], library_name="transformers"
 )
-class GitOpenVINOConfig(TextAndVisionOnnxConfig):
+class GitOpenVINOConfig(BaseVLMOpenVINOConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedTextAndVisionConfig.with_args(vision_config="vision_config")
-    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator, DummyVisionInputGenerator,)
+    # DUMMY_INPUT_GENERATOR_CLASSES = (DummyVisionInputGenerator,)
+    DUMMY_PKV_GENERATOR_CLASS = GemmaDummyPastKeyValuesGenerator
     MIN_TRANSFORMERS_VERSION = "4.51.0"
+
+    def __init__(
+        self,
+        config: "PretrainedConfig",
+        task: str = "feature-extraction",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        behavior: VLMConfigBehavior = VLMConfigBehavior.VISION_EMBEDDINGS,
+        preprocessors: Optional[List[Any]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            config=config,
+            task=task,
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+            preprocessors=preprocessors,
+        )
+        self._behavior = behavior
+        self._orig_config = config
+        self.use_past=True
+        
+        # Set up the normalized config based on behavior
+        if self._behavior == VLMConfigBehavior.VISION_EMBEDDINGS and hasattr(config, "vision_config"):
+            self._config = config.vision_config
+            self._normalized_config = NormalizedVisionConfig(self._config)
+        else:
+            # For other behaviors, use the full config as a text config
+            self._config = config
+            self._normalized_config = NormalizedTextConfig(self._config)
 
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
-        return {
-            "input_ids": {0: "batch_size", 1: "sequence_length"},
-            "pixel_values": {0: "image_batch_size", 1: "num_channels", 2: "height", 3: "width"},
-        }
+        if self._behavior == VLMConfigBehavior.VISION_EMBEDDINGS:
+            return {"pixel_values": {0: "batch_size", 1: "num_channels", 2: "height", 3: "width"}}
+        elif self._behavior == VLMConfigBehavior.TEXT_EMBEDDINGS:
+            return {"input_ids": {0: "batch_size", 1: "sequence_length"}}
+        else:  # LANGUAGE_MODEL
+            return {}
 
-    @property
-    def outputs(self) -> Dict[str, Dict[int, str]]:
-        return {"logits": {0: "batch_size", 1: "sequence_length"}}
+    def get_model_for_behavior(self, model, behavior: Union[str, VLMConfigBehavior]):
+        if isinstance(behavior, str) and not isinstance(behavior, VLMConfigBehavior):
+            behavior = VLMConfigBehavior(behavior)
+
+        if behavior == VLMConfigBehavior.LANGUAGE:
+            return model
+
+        if behavior == VLMConfigBehavior.VISION_EMBEDDINGS:
+            return model.git.image_encoder
+
+        if behavior == VLMConfigBehavior.TEXT_EMBEDDINGS:
+            text_embedding = model.git.embeddings.word_embeddings
+            text_embedding.config = model.config
+            return text_embedding
+
+    def with_behavior(
+        self,
+        behavior: Union[str, VLMConfigBehavior],
+    ):
+        """
+        Creates a config for different behaviour.
+        
+        Args:
+            behavior ([`VLMConfigBehavior`]):
+                The behavior to use for the new instance.
+        """
+        if isinstance(behavior, str) and not isinstance(behavior, VLMConfigBehavior):
+            behavior = VLMConfigBehavior(behavior)
+
+        if behavior == VLMConfigBehavior.TEXT_EMBEDDINGS:
+            # For GIT model, create a custom text embeddings config 
+            # since it doesn't have a separate text_config but uses the main config
+            config = InputEmbedOpenvVINOConfig(
+                self._orig_config,
+                task="feature-extraction",
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+            )
+            config.NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+            return config
+
+        if behavior == VLMConfigBehavior.LANGUAGE:
+            config = LMInputEmbedsConfigHelper(
+                self,  # Use this config as the base
+                patcher_cls=None,
+                dummy_input_generator=None,
+                inputs_update=None,
+            )
+            config._normalized_config = NormalizedTextConfig(self._orig_config)
+            return config
+
+        # Vision
+        return self.__class__(
+            self._orig_config,
+            task=self.task,
+            int_dtype=self.int_dtype,
+            float_dtype=self.float_dtype,
+            behavior=behavior,
+            preprocessors=self._preprocessors,
+        )
 
     def patch_model_for_export(
         self, model: Union["PreTrainedModel", "TFPreTrainedModel"], model_kwargs: Optional[Dict[str, Any]] = None
     ):
         model_kwargs = model_kwargs or {}
+        if self._behavior != VLMConfigBehavior.LANGUAGE:
+            return super().patch_model_for_export(model, model_kwargs)
         return GITModelPatcher(self, model, model_kwargs)

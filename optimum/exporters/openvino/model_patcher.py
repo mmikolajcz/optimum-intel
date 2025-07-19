@@ -6302,11 +6302,30 @@ def git_create_attention_mask(self, tgt, memory, tgt_mask, past_key_values_lengt
     return full_attention_mask
 
 class GITModelPatcher(ModelPatcher):
+    def __init__(
+        self,
+        config: "OnnxConfig",
+        model: Union["PreTrainedModel", "TFPreTrainedModel"],
+        model_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        # https://github.com/huggingface/transformers/blob/v4.49.0-SmolVLM-2/src/transformers/models/git/modeling_git.py#L1052
+        def get_image_features(self, pixel_values, interpolate_pos_encoding):
+            image_hidden_states = self.image_encoder(
+                pixel_values=pixel_values,
+                interpolate_pos_encoding=interpolate_pos_encoding
+            ).last_hidden_state
+
+            return image_hidden_states
+
+        model.__orig_forward = model.forward
+        model.forward = types.MethodType(get_image_features, model)
+        super().__init__(config, model, model_kwargs)
+
     def __enter__(self):
         super().__enter__()
-        self._model.git._orig_create_attention_mask = self._model.git.create_attention_mask
-        self._model.git.create_attention_mask = types.MethodType(git_create_attention_mask, self._model.git)
+        self._model._orig_create_attention_mask = self._model.create_attention_mask
+        self._model.create_attention_mask = types.MethodType(git_create_attention_mask, self._model)
 
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
-        self._model.git.create_attention_mask = self._model.git._orig_create_attention_mask
+        self._model.create_attention_mask = self._model._orig_create_attention_mask

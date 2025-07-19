@@ -235,6 +235,7 @@ MULTI_MODAL_TEXT_GENERATION_MODELS = [
     "phi4mm",
     "phi4-multimodal",
     "llama4",
+    "git",
 ]
 
 
