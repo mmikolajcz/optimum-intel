@@ -901,6 +901,8 @@ class OVModelForCausalLM(OVBaseDecoderModel, GenerationMixin):
             init_cls = OVGPTBigCodeForCausalLM
         elif model_type == "phi3":
             init_cls = OVPhi3ForCausalLM
+        elif model_type == "qwen4_exp_text":
+            init_cls = OVModelForQwen4Exp
         elif model_type in SSM_MODELS:
             init_cls = OVModelWithMambaForCausalLM
         else:
@@ -1149,7 +1151,8 @@ class OVCacheWithMambaStates(MambaCache):
         self.mamba_d_conv = getattr(config, "mamba_d_conv", None)
         self.mamba_expand = getattr(config, "mamba_expand", None)
         self.mamba_d_state = getattr(config, "mamba_d_state", None)
-        self.intermediate_size = config.intermediate_size
+        # MoE hybrid configs (e.g. qwen4_exp_text) have no `intermediate_size`
+        self.intermediate_size = getattr(config, "intermediate_size", None)
         self.conv_kernel_size = getattr(
             config, "conv_kernel", getattr(config, "mamba_d_conv", getattr(config, "conv_L_cache", None))
         )
@@ -1311,6 +1314,12 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
     2. state-space model - ssm_states:  (batch_size, hidden_dim, num_state_features)
     This class supports stateful and stateless inference using OpenVINO.
     """
+
+    def get_experts_implementation(self):
+        return "openvino_impl"
+
+    def set_experts_implementation(self, experts_implementation):
+        return
 
     def __init__(
         self,
@@ -1543,6 +1552,7 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
                     "qwen3_next",
                     "qwen3_5_text",
                     "qwen3_5_moe_text",
+                    "qwen4_exp_text",
                 ]:
                     # LFM2, GraniteMoeHybrid (Granite-4.0) and Qwen3-Next require the attention mask
                     # to be the length of the full context, so default mask from OVModelForCausalLM needs to be used.
@@ -1571,6 +1581,55 @@ class OVModelWithMambaForCausalLM(OVModelForCausalLM):
             }
         )
         return model_inputs
+
+
+class Qwen4ExpExternalCacheMixin:
+    """
+    Carries the Qwen4Exp QSA indexer and position_ids caches between calls. They are kept as model inputs/outputs
+    instead of OV state, see `patch_stateful_hybrid_ssm`.
+    """
+
+    _EXTERNAL_CACHE_PREFIXES = ("cache_params.past.indexer.", "cache_params.past.position_ids")
+
+    @property
+    def _external_cache_names(self) -> List[str]:
+        return [name for name in self.input_names if name.startswith(self._EXTERNAL_CACHE_PREFIXES)]
+
+    def _set_external_cache_inputs(self, inputs: Dict, batch_size: int, new_sequence: bool):
+        if new_sequence or not hasattr(self, "_external_cache"):
+            self._external_cache = {}
+        for name in self._external_cache_names:
+            if name not in self._external_cache:
+                last_dim = self.model.input(name).get_partial_shape()[-1].get_length()
+                self._external_cache[name] = np.zeros((batch_size, 0, last_dim), dtype=np.float32)
+            inputs[name] = self._external_cache[name]
+
+    def _update_external_cache(self):
+        self._external_cache = {
+            name: self.request.get_tensor(name.replace(".past.", ".present.")).data.copy()
+            for name in self._external_cache_names
+        }
+
+
+class OVModelForQwen4Exp(Qwen4ExpExternalCacheMixin, OVModelWithMambaForCausalLM):
+    def prepare_inputs(
+        self, input_ids, attention_mask=None, cache_params=None, use_cache=None, cache_position=None, **kwargs
+    ):
+        inputs = super().prepare_inputs(input_ids, attention_mask, cache_params, use_cache, cache_position, **kwargs)
+
+        if "position_ids" in self.input_names:
+            attention_mask = np.asarray(inputs["attention_mask"])
+            position_ids = np.cumsum(attention_mask, axis=1) - 1
+            position_ids[attention_mask == 0] = 1
+            inputs["position_ids"] = position_ids[:, -input_ids.shape[1] :]
+
+        self._set_external_cache_inputs(inputs, input_ids.shape[0], new_sequence=cache_params is None)
+        return inputs
+
+    def forward(self, *args, **kwargs):
+        outputs = super().forward(*args, **kwargs)
+        self._update_external_cache()
+        return outputs
 
 
 class OVMambaForCausalLM(OVModelWithMambaForCausalLM):

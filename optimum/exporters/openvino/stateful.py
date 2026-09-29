@@ -288,14 +288,26 @@ def patch_stateful_hybrid_ssm(ov_model: ov.Model):
                 other_tensors.append(ov_tensor)
         return kv_names, ssm_names, other_tensors
 
-    ssm_prefix_input_names = ["cache_params.past.ssm", "cache_params.past.conv"]
+    # qwen4_exp QSA `indexer`/`position_ids` caches stay external I/O: as OV state, their growing
+    # `Assign` fails in the CPU plugin with a memory descriptor shape mismatch.
+    ssm_prefix_input_names = [
+        "cache_params.past.ssm",
+        "cache_params.past.conv",
+        "cache_params.past.ple_conv",
+        "cache_params.past.ple_context",
+    ]
     kv_prefix_input_names = ["cache_params.past.key", "cache_params.past.value"]
     kv_input_names, ssm_input_names, not_cache_inputs = get_kv_ssm_tensor_names(
         ssm_prefix_input_names, kv_prefix_input_names, ov_model.inputs
     )
     cache_inputs = kv_input_names + ssm_input_names
 
-    ssm_prefix_output_names = ["cache_params.present.ssm", "cache_params.present.conv"]
+    ssm_prefix_output_names = [
+        "cache_params.present.ssm",
+        "cache_params.present.conv",
+        "cache_params.present.ple_conv",
+        "cache_params.present.ple_context",
+    ]
     kv_prefix_output_names = ["cache_params.present.key", "cache_params.present.value"]
     kv_output_names, ssm_output_names, _ = get_kv_ssm_tensor_names(
         ssm_prefix_output_names, kv_prefix_output_names, ov_model.outputs

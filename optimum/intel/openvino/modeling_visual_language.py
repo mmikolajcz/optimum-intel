@@ -39,7 +39,7 @@ from transformers import (
 )
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLModel
-from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLModel, VisionRotaryEmbedding
+from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLModel
 from transformers.utils import ModelOutput
 
 from optimum.exporters.openvino import main_export
@@ -47,7 +47,11 @@ from optimum.exporters.openvino.stateful import ensure_stateful_is_available, mo
 from optimum.exporters.openvino.utils import save_config
 from optimum.intel.openvino.configuration import OVConfig, OVQuantizationConfigBase, OVWeightQuantizationConfig
 from optimum.intel.openvino.modeling_base import OVBaseModel, OVModelPart
-from optimum.intel.openvino.modeling_decoder import CausalLMOutputWithPast, OVModelForCausalLM
+from optimum.intel.openvino.modeling_decoder import (
+    CausalLMOutputWithPast,
+    OVModelForCausalLM,
+    Qwen4ExpExternalCacheMixin,
+)
 from optimum.intel.openvino.utils import (
     OV_LANGUAGE_MODEL_NAME,
     OV_TEXT_EMBEDDINGS_MODEL_NAME,
@@ -56,6 +60,12 @@ from optimum.intel.openvino.utils import (
     classproperty,
 )
 from optimum.intel.utils.import_utils import is_transformers_version
+
+
+try:
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import VisionRotaryEmbedding
+except ImportError:  # renamed in newer transformers versions
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLVisionRotaryEmbedding as VisionRotaryEmbedding
 
 
 if is_transformers_version(">=", "4.57"):
@@ -220,7 +230,7 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
             if past_len:
                 position_ids = position_ids[..., -inputs_embeds.shape[1] :]
 
-            if self.config.model_type in ["qwen3_5", "qwen3_5_moe"] and position_ids.ndim != 3:
+            if self.config.model_type in ["qwen3_5", "qwen3_5_moe", "qwen4_exp"] and position_ids.ndim != 3:
                 position_ids = np.repeat(np.expand_dims(position_ids, 0), 4, axis=0)
             elif (self.config.model_type in ["qwen2_vl", "qwen2_5_vl", "qwen3_vl"]) and position_ids.ndim == 2:
                 # Qwen2-VL and Qwen3-VL use 3D mrope (3 spatial dimensions)
@@ -269,6 +279,12 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
             if per_layer_inputs is None:
                 raise ValueError("Expected 'per_layer_inputs', but it was not passed")
             inputs["per_layer_inputs"] = torch.Tensor(per_layer_inputs)
+
+        if "ple_input_ids" in self.input_names:
+            ple_input_ids = kwargs.pop("ple_input_ids", None)
+            if ple_input_ids is None:
+                raise ValueError("Expected 'ple_input_ids', but it was not passed")
+            inputs["ple_input_ids"] = ple_input_ids
 
         return inputs
 
@@ -774,6 +790,7 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
     export_feature = "image-text-to-text"
     additional_parts = []
     auto_model_class = AutoModelForImageTextToText
+    _language_model_cls = OVModelWithEmbedForCausalLM
 
     @classproperty
     def _all_ov_model_paths(cls) -> Dict[str, str]:
@@ -825,7 +842,7 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
         if quantization_config:
             self._openvino_config = OVConfig(quantization_config=quantization_config)
         self._set_ov_config_parameters()
-        self.language_model = OVModelWithEmbedForCausalLM(
+        self.language_model = self._language_model_cls(
             language_model,
             text_embeddings,
             config=config,
@@ -1233,6 +1250,9 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
             and extra_outputs
         ):
             additional_kwargs["per_layer_inputs"] = extra_outputs[0]
+
+        if self.config.model_type == "qwen4_exp" and input_ids is not None:
+            additional_kwargs["ple_input_ids"] = input_ids
 
         return self.language_model.forward(
             input_ids=None,
@@ -4236,7 +4256,8 @@ if is_transformers_version(">=", "4.57"):
     _OVQwen3VLForCausalLM.get_placeholder_mask = Qwen3VLModel.get_placeholder_mask
     _OVQwen3VLForCausalLM.get_rope_index = Qwen3VLModel.get_rope_index
     _OVQwen3VLForCausalLM.get_video_features = Qwen3VLModel.get_video_features
-    _OVQwen3VLForCausalLM.rot_pos_emb = Qwen3VLVisionModel.rot_pos_emb
+    # removed from the vision model in newer transformers versions
+    _OVQwen3VLForCausalLM.rot_pos_emb = getattr(Qwen3VLVisionModel, "rot_pos_emb", None)
     _OVQwen3VLForCausalLM.get_vision_position_ids = getattr(Qwen3VLModel, "get_vision_position_ids", None)
 
 
@@ -7551,8 +7572,11 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
 
         self.num_grid_per_side = int(config.vision_config.num_position_embeddings**0.5)
         self.spatial_merge_size = config.vision_config.spatial_merge_size
-        head_dim = config.vision_config.hidden_size // config.vision_config.num_heads
-        self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(head_dim // 2)
+        if "config" in inspect.signature(Qwen3_5VisionRotaryEmbedding.__init__).parameters:
+            self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(config.vision_config)
+        else:
+            head_dim = config.vision_config.hidden_size // config.vision_config.num_heads
+            self.rotary_pos_emb = Qwen3_5VisionRotaryEmbedding(head_dim // 2)
 
     def __setattr__(self, name, value):
         OVModelForVisualCausalLM.__setattr__(self, name, value)
@@ -7570,8 +7594,25 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
         pixel_values_videos=None,
         image_grid_thw=None,
         video_grid_thw=None,
+        mm_token_type_ids=None,
+        is_first_iteration=False,
+        next_sequence_length=None,
         **kwargs,
     ):
+        # reconstruct cache_position as partially removed in v5.3 and totally removed in v5.5
+        if is_transformers_version(">=", "5.3") and (
+            cache_position is None or (not is_first_iteration and cache_position[0] == 0)
+        ):
+            if next_sequence_length is not None:
+                past_len = input_ids.shape[1] - next_sequence_length
+                cache_position = torch.arange(past_len, past_len + next_sequence_length, device=input_ids.device)
+            elif not is_first_iteration and attention_mask is not None:
+                # v5.3 decode step: input_ids is already sliced to 1 token, use attention_mask length
+                past_len = attention_mask.shape[1] - 1
+                cache_position = torch.tensor([past_len], device=input_ids.device)
+            else:
+                cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
+
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
         if past_key_values is not None:
             if inputs_embeds is not None and input_ids.shape[1] == 0:  # Exception 4
@@ -7602,6 +7643,7 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
                 "image_grid_thw": image_grid_thw,
                 "video_grid_thw": video_grid_thw,
                 "cache_position": cache_position,
+                "mm_token_type_ids": mm_token_type_ids,
             }
         )
         return model_inputs
@@ -7902,9 +7944,80 @@ class _OVQwen3_5ForCausalLM(OVModelForVisualCausalLM):
 
 
 if is_transformers_version(">=", "5.2"):
-    _OVQwen3_5ForCausalLM.get_placeholder_mask = Qwen3_5Model.get_placeholder_mask
-    _OVQwen3_5ForCausalLM.get_rope_index = Qwen3_5Model.get_rope_index
-    _OVQwen3_5ForCausalLM.rot_pos_emb = Qwen3_5VisionModel.rot_pos_emb
+    _OVQwen3_5ForCausalLM.get_placeholder_mask = getattr(Qwen3_5Model, "get_placeholder_mask", None)
+    _OVQwen3_5ForCausalLM.get_rope_index = getattr(Qwen3_5Model, "get_rope_index", None)
+    _OVQwen3_5ForCausalLM.rot_pos_emb = getattr(Qwen3_5VisionModel, "rot_pos_emb", None)
+
+
+class OVModelWithEmbedForQwen4ExpCausalLM(Qwen4ExpExternalCacheMixin, OVModelWithEmbedForCausalLM):
+    def prepare_inputs(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        inputs = super().prepare_inputs(
+            input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
+        )
+        batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+        self._set_external_cache_inputs(inputs, batch_size, new_sequence=past_key_values is None)
+        return inputs
+
+    def forward(self, *args, **kwargs):
+        outputs = super().forward(*args, **kwargs)
+        self._update_external_cache()
+        return outputs
+
+
+class _OVQwen4ExpForCausalLM(_OVQwen3_5ForCausalLM):
+    _language_model_cls = OVModelWithEmbedForQwen4ExpCausalLM
+
+    def get_experts_implementation(self):
+        return "openvino_impl"
+
+    def set_experts_implementation(self, experts_implementation):
+        return
+
+
+if is_transformers_version(">=", "5.16"):
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpModel
+
+    def _qwen4_exp_rot_pos_emb(self, grid_thw):
+        pos_ids = []
+        for t, h, w in grid_thw:
+            hpos_ids = torch.arange(h, device=grid_thw.device).unsqueeze(1).expand(-1, w)
+            wpos_ids = torch.arange(w, device=grid_thw.device).unsqueeze(0).expand(h, -1)
+            merge = self.spatial_merge_size
+            hpos_ids = hpos_ids.reshape(h // merge, merge, w // merge, merge).permute(0, 2, 1, 3).flatten()
+            wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge).permute(0, 2, 1, 3).flatten()
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        # the exported merger expects raw (N, head_dim // 2) frequencies, not the (cos, sin) the HF rotary returns
+        freqs = pos_ids[..., None].float() * self.rotary_pos_emb.inv_freq.float()
+        return torch.cat([freqs[:, 0], freqs[:, 1]], dim=-1)
+
+    def _qwen4_exp_get_rope_index(
+        self,
+        input_ids,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        attention_mask=None,
+        mm_token_type_ids=None,
+        **kwargs,
+    ):
+        if mm_token_type_ids is None:
+            mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
+            mm_token_type_ids[input_ids == self.config.image_token_id] = 1
+            mm_token_type_ids[input_ids == self.config.video_token_id] = 2
+        return Qwen4ExpModel.get_rope_index(
+            self,
+            input_ids,
+            mm_token_type_ids=mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+
+    _OVQwen4ExpForCausalLM.get_placeholder_mask = Qwen4ExpModel.get_placeholder_mask
+    _OVQwen4ExpForCausalLM.get_rope_index = _qwen4_exp_get_rope_index
+    _OVQwen4ExpForCausalLM.get_vision_position_ids = Qwen4ExpModel.get_vision_position_ids
+    _OVQwen4ExpForCausalLM.rot_pos_emb = _qwen4_exp_rot_pos_emb
 
 
 class _OVMuseGlimmerForCausalLM(OVModelForVisualCausalLM):
@@ -8037,6 +8150,8 @@ MODEL_TYPE_TO_CLS_MAPPING = {
     "qwen3_5_text": _OVQwen3_5ForCausalLM,
     "qwen3_5_moe": _OVQwen3_5ForCausalLM,
     "qwen3_5_moe_text": _OVQwen3_5ForCausalLM,
+    "qwen4_exp": _OVQwen4ExpForCausalLM,
+    "qwen4_exp_text": _OVQwen4ExpForCausalLM,
     "qwen3_omni_moe": _OVQwen3OmniMoeForCausalLM,
     "minicpmo": _OVMiniCPMOForCausalLM,
     "videochat_flash_qwen": _OVVideoChatFlashQwenForCausalLM,
