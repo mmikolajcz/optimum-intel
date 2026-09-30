@@ -11127,12 +11127,17 @@ def qwen4_exp_traceable_qsa_indexer_forward(
 
     # block -> token expansion; int32 scatter since the GPU plugin has no layout for bool ScatterElementsUpdate
     token_ids = torch.arange(kv_length, device=raw_keys.device)  # [KV]
-    token_block_ids = token_ids // R  # [KV]
     selected_by_block_mask = torch.zeros(
         batch_size, seq_length, num_blocks_padded, dtype=torch.int32, device=raw_keys.device
     )
     selected_by_block_mask = selected_by_block_mask.scatter(-1, top_block_idx, top_valid.to(torch.int32))
-    selected_by_token_from_block = selected_by_block_mask.index_select(-1, token_block_ids).bool()  # [B, S, KV]
+    selected_by_token_from_block = (
+        selected_by_block_mask[..., :num_real_blocks]
+        .unsqueeze(-1)
+        .expand(-1, -1, -1, R)
+        .reshape(batch_size, seq_length, num_real_blocks * R)
+    )
+    selected_by_token_from_block = F.pad(selected_by_token_from_block, (0, kv_length - num_real_blocks * R)).bool()
 
     # tokens after the last complete block are always attended
     tail_start_per_query = num_complete_blocks_per_query * R  # [S]
