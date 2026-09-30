@@ -1617,6 +1617,11 @@ class OVModelForQwen4Exp(Qwen4ExpExternalCacheMixin, OVModelWithMambaForCausalLM
     ):
         inputs = super().prepare_inputs(input_ids, attention_mask, cache_params, use_cache, cache_position, **kwargs)
 
+        # QSA takes the kv length from the mask; the Mamba base class falls back to a current-tokens-only mask
+        full_length = getattr(self, "_past_length", 0) + input_ids.shape[1]
+        if "attention_mask" in inputs and inputs["attention_mask"].shape[-1] != full_length:
+            inputs["attention_mask"] = np.ones((input_ids.shape[0], full_length), dtype=np.int64)
+
         if "position_ids" in self.input_names:
             attention_mask = np.asarray(inputs["attention_mask"])
             position_ids = np.cumsum(attention_mask, axis=1) - 1
