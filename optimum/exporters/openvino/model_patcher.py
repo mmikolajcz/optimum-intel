@@ -10505,6 +10505,16 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                 # base implementation reads `self.layers`, which this wrap does not use for key/value
                 return self.get_seq_length(layer_idx) + query_length, 0
 
+            def update_conv_state(self, conv_states: torch.Tensor, layer_idx: int, state_idx: int = 0, **kwargs):
+                # Same roll as the base layer method, but assigned instead of an in-place `copy_` into the state,
+                # workaround conversion error
+                layer = self.layers[layer_idx]
+                if not layer.has_previous_state[state_idx]:
+                    return super().update_conv_state(conv_states, layer_idx, state_idx=state_idx, **kwargs)
+                full_conv_states = torch.cat([layer.conv_states[state_idx], conv_states], dim=-1)
+                layer.conv_states[state_idx] = full_conv_states[..., -layer.conv_kernel_size[state_idx] :]
+                return full_conv_states
+
             if legacy_cache:  # newer DynamicCache has a `has_previous_state(layer_idx, state_idx)` method instead
 
                 @property
