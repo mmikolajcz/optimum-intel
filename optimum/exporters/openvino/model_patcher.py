@@ -11215,17 +11215,28 @@ def _qwen4_exp_clean_limbs_of_product(token_i32: torch.Tensor, mult_limbs_const:
     return clean
 
 
-def _qwen4_exp_mod_small(limbs: list, modulus: int) -> torch.Tensor:
-    """Big integer (12-bit limbs) modulo a small int via bitwise double-and-reduce, avoiding Remainder/FloorMod."""
-    r = torch.zeros_like(limbs[0])
-    mod_t = torch.full_like(limbs[0], modulus)
-    for i in reversed(range(len(limbs) * _QWEN4_EXP_HASH_LIMB_BITS)):
-        limb_idx, bit_idx = divmod(i, _QWEN4_EXP_HASH_LIMB_BITS)
-        bit = (limbs[limb_idx] >> bit_idx) & 1
-        r = r * 2 + bit
-        ge = (r >= mod_t).to(r.dtype)
-        r = r - ge * mod_t
-    return r
+def _qwen4_exp_mod_exact(x: torch.Tensor, modulus: torch.Tensor) -> torch.Tensor:
+    """`x mod modulus` for int32 0 <= x < 2**31: float quotient estimate (off by at most 1), exact int32 correction.
+
+    The CPU plugin computes int32 FloorMod through float, which is inexact above 2**24.
+    """
+    q = torch.floor(x.to(torch.float32) / modulus.to(torch.float32)).to(torch.int32)
+    r = x - q * modulus
+    r = r + (r < 0).to(torch.int32) * modulus
+    return r - (r >= modulus).to(torch.int32) * modulus
+
+
+def _qwen4_exp_limbs_mod_primes(limbs: list, weights: torch.Tensor, moduli: torch.Tensor) -> torch.Tensor:
+    """Big integer in 12-bit limbs modulo several primes at once, as `sum_k limb6_k * (2**(6k) mod p) mod p` in int32.
+
+    6-bit limbs keep every product below 2**31 (63 * p, p < 2**25); `weights` is [2 * len(limbs), heads].
+    """
+    limbs6 = torch.stack([half for limb in limbs for half in (limb & 63, limb >> 6)], dim=-1)  # [B, S, L]
+    terms = _qwen4_exp_mod_exact(limbs6.unsqueeze(-1) * weights, moduli)  # [B, S, L, heads]
+    total = terms[..., 0, :]
+    for k in range(1, terms.shape[-2]):  # explicit Adds: CPU int32 ReduceSum is inexact above 2**24
+        total = total + terms[..., k, :]
+    return _qwen4_exp_mod_exact(total, moduli)
 
 
 def qwen4_exp_traceable_ngram_embedding_forward(self, input_ids: torch.Tensor, past_key_values) -> torch.Tensor:
@@ -11255,19 +11266,14 @@ def qwen4_exp_traceable_ngram_embedding_forward(self, input_ids: torch.Tensor, p
     ]
 
     blocks = []
-    for ngram in range(2, self.ngram_size + 1):
-        start_idx = (ngram - 2) * self.heads_per_ngram
-        end_idx = start_idx + self.heads_per_ngram
+    for group, ngram in enumerate(range(2, self.ngram_size + 1)):
         mixed_limbs = limb_lists[0]
         for position in range(1, ngram):
             mixed_limbs = [a ^ b for a, b in zip(mixed_limbs, limb_lists[position])]
-        head_results = []
-        for head_idx in range(start_idx, end_idx):
-            modulus = self._qwen4_exp_head_vocab_sizes_py[head_idx]
-            offset = self._qwen4_exp_head_offsets_py[head_idx]
-            reduced = _qwen4_exp_mod_small(mixed_limbs, modulus)
-            head_results.append(reduced.to(torch.int64) + offset)
-        blocks.append(torch.stack(head_results, dim=-1))
+        reduced = _qwen4_exp_limbs_mod_primes(
+            mixed_limbs, self._qwen4_exp_mod_weights[group], self._qwen4_exp_moduli[group]
+        )
+        blocks.append(reduced.to(torch.int64) + self._qwen4_exp_head_offsets[group])
 
     ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1] :]
     execution_device = (
@@ -11298,8 +11304,21 @@ class Qwen4ExpModelPatcher(Qwen3_5MoeModelPatcher):
                 ngram_embedding._qwen4_exp_layer_multiplier_limbs = torch.tensor(
                     [_qwen4_exp_decompose_int_to_limbs(m, num_mult_limbs) for m in multipliers], dtype=torch.int32
                 )
-                ngram_embedding._qwen4_exp_head_vocab_sizes_py = ngram_embedding.ngram_heads_vocab_sizes.tolist()
-                ngram_embedding._qwen4_exp_head_offsets_py = ngram_embedding.ngram_heads_offsets.tolist()
+                num_limbs6 = 2 * (num_mult_limbs + _QWEN4_EXP_HASH_SPREAD_LIMBS)
+                moduli = ngram_embedding.ngram_heads_vocab_sizes.tolist()
+                assert 63 * max(moduli) < 2**31, "n-gram head vocab sizes too large for the int32 modular hash"
+                heads = ngram_embedding.heads_per_ngram
+                groups = [range(g * heads, (g + 1) * heads) for g in range(ngram_embedding.ngram_size - 1)]
+                ngram_embedding._qwen4_exp_mod_weights = [
+                    torch.tensor([[pow(2, 6 * k, moduli[h]) for h in group] for k in range(num_limbs6)], dtype=torch.int32)
+                    for group in groups
+                ]
+                ngram_embedding._qwen4_exp_moduli = [
+                    torch.tensor([moduli[h] for h in group], dtype=torch.int32) for group in groups
+                ]
+                ngram_embedding._qwen4_exp_head_offsets = [
+                    ngram_embedding.ngram_heads_offsets[group.start : group.stop] for group in groups
+                ]
                 ngram_embedding._orig_shift_right_ignore_eos = ngram_embedding._shift_right_ignore_eos
                 ngram_embedding._shift_right_ignore_eos = types.MethodType(
                     qwen4_exp_traceable_shift_right_ignore_eos, ngram_embedding
