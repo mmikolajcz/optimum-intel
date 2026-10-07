@@ -294,7 +294,6 @@ def patch_stateful_hybrid_ssm(ov_model: ov.Model):
         "cache_params.past.ssm",
         "cache_params.past.conv",
         "cache_params.past.ple_conv",
-        "cache_params.past.ple_context",
     ]
     kv_prefix_input_names = ["cache_params.past.key", "cache_params.past.value"]
     kv_input_names, ssm_input_names, not_cache_inputs = get_kv_ssm_tensor_names(
@@ -306,7 +305,6 @@ def patch_stateful_hybrid_ssm(ov_model: ov.Model):
         "cache_params.present.ssm",
         "cache_params.present.conv",
         "cache_params.present.ple_conv",
-        "cache_params.present.ple_context",
     ]
     kv_prefix_output_names = ["cache_params.present.key", "cache_params.present.value"]
     kv_output_names, ssm_output_names, _ = get_kv_ssm_tensor_names(

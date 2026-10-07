@@ -2119,7 +2119,7 @@ class Qwen3_5DummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
 class Qwen4ExpDummyPastKeyValuesGenerator(Qwen3_5DummyPastKeyValuesGenerator):
     """
     Qwen3.5 cache layout (QSA layers cache key/value like full attention), followed by one indexer key cache per
-    QSA layer, a (ple_conv, ple_context) pair per PLE layer and the accumulated QSA position_ids.
+    QSA layer, a short-conv state per PLE layer and the accumulated QSA position_ids.
     """
 
     def __init__(self, task, normalized_config, **kwargs):
@@ -2133,10 +2133,7 @@ class Qwen4ExpDummyPastKeyValuesGenerator(Qwen3_5DummyPastKeyValuesGenerator):
         self.ple_layer_ids = list(getattr(config, "ple_layer_ids", None) or [])
         if self.ple_layer_ids:
             self.ple_short_conv_len = (config.ple_conv_kernel_size - 1) * config.ngram_size
-            self.ple_context_len = config.ngram_size - 1
             self.ple_hc_hidden_size = config.hidden_size * config.hc_count
-            eos_token_id = config.eos_token_id
-            self.ple_eos_token_id = eos_token_id[0] if isinstance(eos_token_id, list) else eos_token_id
 
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
         cache_params = super().generate(input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype)
@@ -2146,11 +2143,6 @@ class Qwen4ExpDummyPastKeyValuesGenerator(Qwen3_5DummyPastKeyValuesGenerator):
         for _ in self.ple_layer_ids:
             short_conv_shape = (self.batch_size, self.ple_hc_hidden_size, self.ple_short_conv_len)
             cache_params.append(self.random_float_tensor(short_conv_shape, framework=framework, dtype=float_dtype))
-            # int32: the CPU plugin fails to compile the beam-reorder Gather for an int64 state
-            previous_context = torch.full(
-                (self.batch_size, self.ple_context_len), self.ple_eos_token_id, dtype=torch.int32
-            )
-            cache_params.append(previous_context)
         if self.num_qsa_layers:
             # (batch, seq, 3) float32 - same layout/dtype as the other growing caches, positions are exact in fp32
             position_ids_shape = (self.batch_size, self.sequence_length, 3)

@@ -152,6 +152,8 @@ def _save_model(
 
     if getattr(config, "eagle3", False):
         model = _add_eagle3_mode_to_rt_info(model)
+    if getattr(config, "qwen4_exp_ngram_hash", False):
+        model = _add_qwen4_exp_ngram_hash_mode_to_rt_info(model)
     if getattr(config, "dflash", False):
         model = _add_dflash_mode_to_rt_info(
             model,
@@ -1021,6 +1023,19 @@ def _add_eagle3_mode_to_rt_info(model: Model):
     """
     try:
         model.set_rt_info("True", ["eagle3_mode"])
+    except Exception:
+        pass
+
+    return model
+
+
+def _add_qwen4_exp_ngram_hash_mode_to_rt_info(model: Model) -> Model:
+    """
+    Mark the standalone qwen4_exp n-gram embeddings model, so the runtime can tell the regular
+    `language_model` submodel apart from the `ngram_embeddings` one even without relying on the file name.
+    """
+    try:
+        model.set_rt_info("True", ["qwen4_exp", "ngram_hash"])
     except Exception:
         pass
 

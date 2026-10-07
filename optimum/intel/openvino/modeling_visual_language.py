@@ -280,11 +280,11 @@ class OVModelWithEmbedForCausalLM(OVModelForCausalLM):
                 raise ValueError("Expected 'per_layer_inputs', but it was not passed")
             inputs["per_layer_inputs"] = torch.Tensor(per_layer_inputs)
 
-        if "ple_input_ids" in self.input_names:
-            ple_input_ids = kwargs.pop("ple_input_ids", None)
-            if ple_input_ids is None:
-                raise ValueError("Expected 'ple_input_ids', but it was not passed")
-            inputs["ple_input_ids"] = ple_input_ids
+        if "ple_embeds" in self.input_names:
+            ple_embeds = kwargs.pop("ple_embeds", None)
+            if ple_embeds is None:
+                raise ValueError("Expected 'ple_embeds', but it was not passed")
+            inputs["ple_embeds"] = ple_embeds
 
         return inputs
 
@@ -423,6 +423,46 @@ class OVMTPModel(OVModelPart):
         self.compile()
         inputs = {name: kwargs[name] for name in self.input_names if name in kwargs}
         return self.request(inputs)
+
+
+class OVQwen4ExpNGramEmbeddings(OVModelPart):
+    """
+    Wrapper for the standalone, stateless qwen4_exp PLE n-gram hash + embedding lookup submodel (see
+    `Qwen4ExpNGramEmbeddingsModule`). Unlike the language model, it carries no KV-cache: every call takes
+    a flat window of raw token ids, `ngram_token_ids` of shape `[B, context_len + S]` (the `context_len`
+    tokens preceding the current chunk, padded with eos if there is no history yet, followed by the `S`
+    tokens of the current chunk), and returns `ple_embeds`.
+
+    `start`/`result` split inference into async start + wait so it can run concurrently with the rest of
+    the embeddings preparation; see `OVModelWithEmbedForQwen4ExpCausalLM._ngram_start`.
+    """
+
+    _model_name = "ngram_embeddings"
+
+    def __init__(self, model: ov.Model, parent_model: OVBaseModel) -> None:
+        super().__init__(model, parent_model, model_name=self._model_name)
+        self._infer_request = None
+
+    def compile(self):
+        super().compile()
+        if self._infer_request is None and self.request is not None:
+            compiled = self.request if isinstance(self.request, ov.CompiledModel) else None
+            if compiled is not None:
+                self._infer_request = compiled.create_infer_request()
+            else:
+                self._infer_request = self.request
+
+    def start(self, ngram_token_ids: torch.Tensor):
+        self.compile()
+        self._infer_request.start_async({"ngram_token_ids": ngram_token_ids}, share_inputs=True)
+
+    def result(self) -> torch.Tensor:
+        self._infer_request.wait()
+        return torch.from_numpy(self._infer_request.get_tensor("ple_embeds").data).clone()
+
+    def forward(self, ngram_token_ids: torch.Tensor) -> torch.Tensor:
+        self.start(ngram_token_ids)
+        return self.result()
 
 
 class OVAudioEmbeddings(OVModelPart):
@@ -783,6 +823,7 @@ MODEL_PARTS_CLS_MAPPING = {
     "code_predictor": OVCodePredictorDecoder,
     "code2wav": OVCode2Wav,
     "mtp": OVMTPModel,
+    "ngram_embeddings": OVQwen4ExpNGramEmbeddings,
 }
 
 
@@ -859,6 +900,12 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
             if model_part is not None:
                 model_part = MODEL_PARTS_CLS_MAPPING[part](model_part, self)
             setattr(self, part, model_part)
+
+        if getattr(self, "ngram_embeddings", None) is not None:
+            # qwen4_exp only: the PLE n-gram hash + embedding lookup lives on the composite VLM model as any
+            # other additional part, but the token-history window it needs is naturally tracked alongside the
+            # language model's own past-length/cache state, see `OVModelWithEmbedForQwen4ExpCausalLM._ngram_start`.
+            self.language_model._ngram_part = self.ngram_embeddings
 
         if enable_compilation and not self._compile_only:
             self.compile()
@@ -7949,14 +7996,59 @@ if is_transformers_version(">=", "5.2"):
     _OVQwen3_5ForCausalLM.rot_pos_emb = getattr(Qwen3_5VisionModel, "rot_pos_emb", None)
 
 
+def _qwen4_exp_eos_id(text_config) -> int:
+    eos_token_id = text_config.eos_token_id
+    return eos_token_id[0] if isinstance(eos_token_id, (list, tuple)) else eos_token_id
+
+
 class OVModelWithEmbedForQwen4ExpCausalLM(Qwen4ExpExternalCacheMixin, OVModelWithEmbedForCausalLM):
+    def _ngram_start(self, input_ids: torch.LongTensor, attention_mask, new_sequence: bool):
+        """
+        Kicks off the `ngram_embeddings` inference for the current chunk: builds the flat
+        `[B, context_len + S]` token window expected by the exported model (the last `context_len`
+        already-seen tokens, padded with eos when there isn't enough history yet, followed by the `S`
+        tokens of the current chunk) and starts it asynchronously. The result is read back in
+        `prepare_inputs` via `self._ngram_part.result()`.
+        """
+        text_config = getattr(self.config, "text_config", self.config)
+        context_len = text_config.ngram_size - 1
+        eos_token_id = _qwen4_exp_eos_id(text_config)
+        ids = input_ids.to(torch.int64)
+        if new_sequence or getattr(self, "_ple_tokens", None) is None:
+            self._ple_tokens = ids.new_zeros((ids.shape[0], 0))
+        if attention_mask is not None:
+            mask = torch.as_tensor(attention_mask)[:, -ids.shape[1] :]
+            ids = torch.where(mask != 0, ids, ids.new_full((), eos_token_id))
+        history = self._ple_tokens
+        context = history[:, history.shape[1] - min(history.shape[1], context_len) :]
+        if context.shape[1] < context_len:
+            pad = context.new_full((ids.shape[0], context_len - context.shape[1]), eos_token_id)
+            context = torch.cat([pad, context], dim=1)
+        window = torch.cat([context, ids], dim=1)
+        self._ple_tokens = torch.cat([history, ids], dim=1)[:, -context_len:]
+        self._ngram_part.start(window)
+        self._ngram_pending = True
+
     def prepare_inputs(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+        if "ple_embeds" in self.input_names:
+            ple_input_ids = kwargs.pop("ple_input_ids", None)
+            if not getattr(self, "_ngram_pending", False):
+                ids = ple_input_ids if ple_input_ids is not None else input_ids
+                self._ngram_start(ids, kwargs.get("attention_mask"), new_sequence=past_key_values is None)
+            self._ngram_pending = False
+            kwargs["ple_embeds"] = self._ngram_part.result()
+
         inputs = super().prepare_inputs(
             input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs
         )
         batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
         self._set_external_cache_inputs(inputs, batch_size, new_sequence=past_key_values is None)
         return inputs
+
+    def _reorder_cache(self, past_key_values, beam_idx):
+        if getattr(self, "_ple_tokens", None) is not None:
+            self._ple_tokens = self._ple_tokens[torch.as_tensor(beam_idx)]
+        return super()._reorder_cache(past_key_values, beam_idx)
 
     def forward(self, *args, **kwargs):
         outputs = super().forward(*args, **kwargs)
@@ -7966,6 +8058,7 @@ class OVModelWithEmbedForQwen4ExpCausalLM(Qwen4ExpExternalCacheMixin, OVModelWit
 
 class _OVQwen4ExpForCausalLM(_OVQwen3_5ForCausalLM):
     _language_model_cls = OVModelWithEmbedForQwen4ExpCausalLM
+    additional_parts = _OVQwen3_5ForCausalLM.additional_parts + ["ngram_embeddings"]
 
     def get_experts_implementation(self):
         return "openvino_impl"

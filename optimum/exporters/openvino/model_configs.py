@@ -218,6 +218,8 @@ from optimum.exporters.openvino.model_patcher import (
     Qwen3VLLanguageModelPatcher,
     Qwen3VLVisionEmbMergerPatcher,
     Qwen4ExpModelPatcher,
+    Qwen4ExpNGramEmbeddingsModule,
+    Qwen4ExpNGramEmbeddingsPatcher,
     QwenImage21I2ITextEncoderModelPatcher,
     QwenImage21TextEncoderModelPatcher,
     QwenImage21TransformerModelPatcher,
@@ -1851,8 +1853,17 @@ class LMInputEmbedsConfigHelper(TextDecoderWithPositionIdsOpenVINOConfig):
             inputs_embed_shape
         )
         dummy_inputs["inputs_embeds"] = inputs_embeds
-        if "ple_input_ids" in self.inputs:
-            dummy_inputs["ple_input_ids"] = input_ids
+        if "ple_embeds" in self.inputs:
+            num_ple_layers = len(getattr(self._normalized_config.config, "ple_layer_ids", None) or [])
+            ple_embeds_shape = (
+                input_ids.shape[0],
+                input_ids.shape[1],
+                num_ple_layers,
+                self._normalized_config.config.ple_embed_dim,
+            )
+            dummy_inputs["ple_embeds"] = self.orig_export_config.DUMMY_INPUT_GENERATOR_CLASSES[0].random_float_tensor(
+                ple_embeds_shape
+            )
         if "token_type_ids" in self.inputs:
             token_type_ids_shape = (input_ids.shape[0], input_ids.shape[1] + pask_key_values[0][0].shape[-2])
             dummy_inputs["token_type_ids"] = self.orig_export_config.DUMMY_INPUT_GENERATOR_CLASSES[
@@ -4015,16 +4026,18 @@ class QwenVLConfigBehavior(str, enum.Enum):
     TEXT_EMBEDDINGS = "text_embeddings"
     VISION_EMBEDDINGS_POS = "vision_embeddings_pos"
     MTP = "mtp"
+    NGRAM_EMBEDDINGS = "ngram_embeddings"
 
 
 @register_in_tasks_manager("qwen2_vl", *["image-text-to-text"], library_name="transformers")
 class Qwen2VLOpenVINOConfig(BaseVLMOpenVINOConfig):
-    # `mtp` is a Qwen3.5-only behavior; exclude it here so it does not leak into qwen2_vl /
-    # qwen2_5_vl (which inherit this list) and try to export a non-existent MTP submodel.
+    # `mtp` is a Qwen3.5-only behavior, `ngram_embeddings` is a qwen4_exp-only behavior; exclude both here
+    # so they does not leak into qwen2_vl / qwen2_5_vl (which inherit this list) and try to export a
+    # non-existent submodel.
     SUPPORTED_BEHAVIORS = [
         model_type.value
         for model_type in QwenVLConfigBehavior
-        if model_type.value not in ("vision_embeddings_pos", "mtp")
+        if model_type.value not in ("vision_embeddings_pos", "mtp", "ngram_embeddings")
     ]
     NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyQwen2VLVisionEmbedInputGenerator,)
@@ -4194,9 +4207,14 @@ class Qwen2_5_VLOpenVINOConfig(Qwen2VLOpenVINOConfig):
     library_name="transformers",
 )
 class Qwen3VLOpenVINOConfig(Qwen2VLOpenVINOConfig):
-    # `mtp` is a Qwen3.5-only behavior (Qwen3.5 re-adds it conditionally); keep it out of the
-    # generic qwen3_vl behavior list so it does not try to export a non-existent MTP submodel.
-    SUPPORTED_BEHAVIORS = [model_type.value for model_type in QwenVLConfigBehavior if model_type.value != "mtp"]
+    # `mtp` is a Qwen3.5-only behavior (Qwen3.5 re-adds it conditionally); `ngram_embeddings` is a
+    # qwen4_exp-only behavior (Qwen4ExpOpenVINOConfig re-adds it conditionally). Keep both out of the
+    # generic qwen3_vl behavior list so it does not try to export non-existent submodels.
+    SUPPORTED_BEHAVIORS = [
+        model_type.value
+        for model_type in QwenVLConfigBehavior
+        if model_type.value not in ("mtp", "ngram_embeddings")
+    ]
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyQwen3VLVisionEmbedInputGenerator,)
 
     def __init__(
@@ -7534,7 +7552,9 @@ class Qwen3_5TextOpenVINOConfig(Qwen3VLTextOpenVINOConfig):
 )
 class Qwen3_5OpenVINOConfig(Qwen3VLOpenVINOConfig):
     SUPPORTED_BEHAVIORS = [
-        model_type.value for model_type in QwenVLConfigBehavior if model_type != QwenVLConfigBehavior.MTP
+        model_type.value
+        for model_type in QwenVLConfigBehavior
+        if model_type not in (QwenVLConfigBehavior.MTP, QwenVLConfigBehavior.NGRAM_EMBEDDINGS)
     ]
     DUMMY_INPUT_GENERATOR_CLASSES = (DummyQwen3VLVisionEmbedInputGenerator,)
     MIN_TRANSFORMERS_VERSION = "5.2.0"
@@ -7709,7 +7729,6 @@ class Qwen4ExpTextOpenVINOConfig(Qwen3_5TextOpenVINOConfig):
             inputs_or_outputs[f"{cache_name_prefix}.indexer.{i}"] = {0: "batch_size", 1: decoder_sequence_name}
         for i in range(num_ple_layers):
             inputs_or_outputs[f"{cache_name_prefix}.ple_conv.{i}"] = {0: "batch_size"}
-            inputs_or_outputs[f"{cache_name_prefix}.ple_context.{i}"] = {0: "batch_size"}
         if num_qsa_layers:
             inputs_or_outputs[f"{cache_name_prefix}.position_ids"] = {0: "batch_size", 1: decoder_sequence_name}
 
@@ -7727,6 +7746,11 @@ class Qwen4ExpOpenVINOConfig(Qwen3_5OpenVINOConfig):
         super().__init__(*args, **kwargs)
         # MTP head export is not supported for qwen4_exp
         self.SUPPORTED_BEHAVIORS = [b for b in self.SUPPORTED_BEHAVIORS if b != QwenVLConfigBehavior.MTP.value]
+        # The n-gram embeddings submodel only exists for checkpoints with PLE layers
+        text_config = getattr(self._orig_config, "text_config", self._orig_config)
+        if getattr(text_config, "ple_layer_ids", None):
+            if QwenVLConfigBehavior.NGRAM_EMBEDDINGS.value not in self.SUPPORTED_BEHAVIORS:
+                self.SUPPORTED_BEHAVIORS = self.SUPPORTED_BEHAVIORS + [QwenVLConfigBehavior.NGRAM_EMBEDDINGS.value]
 
     def with_behavior(self, behavior: Union[str, QwenVLConfigBehavior]):
         if isinstance(behavior, str) and not isinstance(behavior, QwenVLConfigBehavior):
@@ -7740,8 +7764,10 @@ class Qwen4ExpOpenVINOConfig(Qwen3_5OpenVINOConfig):
         if behavior == QwenVLConfigBehavior.LANGUAGE:
             inputs_update = {"position_ids": {1: "batch_size", 2: "sequence_length"}}
             if getattr(self._orig_config.text_config, "ple_layer_ids", None):
-                # PLE needs real token ids, which can't be recovered from inputs_embeds once image embeddings are merged
-                inputs_update["ple_input_ids"] = {0: "batch_size", 1: "sequence_length"}
+                # The PLE embeddings are now computed by the separate `ngram_embeddings` submodel (see
+                # `Qwen4ExpNGramEmbeddingsModule`) and fed in here instead of being recomputed from
+                # `input_ids`, which can't be recovered from `inputs_embeds` once image embeddings are merged.
+                inputs_update["ple_embeds"] = {0: "batch_size", 1: "sequence_length"}
             return get_vlm_text_generation_config(
                 "qwen4_exp_text",
                 self._orig_config.text_config,
@@ -7752,7 +7778,24 @@ class Qwen4ExpOpenVINOConfig(Qwen3_5OpenVINOConfig):
                 inputs_update=inputs_update,
             )
 
+        if behavior == QwenVLConfigBehavior.NGRAM_EMBEDDINGS:
+            return Qwen4ExpNGramEmbeddingsOpenVINOConfig(
+                self._orig_config,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+            )
+
         return super().with_behavior(behavior)
+
+    @staticmethod
+    def get_model_for_behavior(model, behavior: Union[str, QwenVLConfigBehavior]):
+        if isinstance(behavior, str) and not isinstance(behavior, QwenVLConfigBehavior):
+            behavior = QwenVLConfigBehavior(behavior)
+
+        if behavior == QwenVLConfigBehavior.NGRAM_EMBEDDINGS:
+            return Qwen4ExpNGramEmbeddingsModule.from_pretrained_model(model)
+
+        return Qwen3_5OpenVINOConfig.get_model_for_behavior(model, behavior)
 
     @property
     def outputs(self) -> Dict[str, Dict[int, str]]:
@@ -7761,6 +7804,58 @@ class Qwen4ExpOpenVINOConfig(Qwen3_5OpenVINOConfig):
                 "qwen4_exp_text", self._orig_config.text_config, self.int_dtype, self.float_dtype
             ).outputs
         return super().outputs
+
+
+class Qwen4ExpNGramEmbeddingsOpenVINOConfig(OpenVINOConfig):
+    """
+    Export configuration for the standalone qwen4_exp PLE n-gram hash + embedding module, see
+    `Qwen4ExpNGramEmbeddingsModule`. Unlike the language model, this submodel is stateless: there is no
+    KV-cache, the token window (the `context_len` tokens preceding the current chunk, followed by the
+    tokens of the current chunk) is passed in directly as a plain input on every call.
+    """
+
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyTextInputGenerator,)
+    _MODEL_PATCHER = Qwen4ExpNGramEmbeddingsPatcher
+    # duck-typed marker read by `convert.py`'s `_save_model`, see `_add_qwen4_exp_ngram_hash_mode_to_rt_info`
+    qwen4_exp_ngram_hash = True
+
+    def __init__(
+        self,
+        config: "PretrainedConfig",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+    ):
+        text_config = getattr(config, "text_config", config)
+        super().__init__(
+            text_config,
+            task="feature-extraction",
+            int_dtype=int_dtype,
+            float_dtype=float_dtype,
+        )
+        self._orig_config = config
+        self._text_config = text_config
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {"ngram_token_ids": {0: "batch_size", 1: "sequence_length"}}
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {"ple_embeds": {0: "batch_size", 1: "sequence_length"}}
+
+    def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
+        batch_size = kwargs.get("batch_size", 2)
+        sequence_length = kwargs.get("sequence_length", 16)
+        context_len = self._text_config.ngram_size - 1
+        dummy_input_gen = self.DUMMY_INPUT_GENERATOR_CLASSES[0](
+            self.task,
+            self._normalized_config,
+            batch_size=batch_size,
+            sequence_length=context_len + sequence_length,
+        )
+        ngram_token_ids = dummy_input_gen.generate("input_ids", framework=framework, int_dtype=self.int_dtype)
+        return {"ngram_token_ids": ngram_token_ids}
 
 
 class Qwen3_5MTPOpenVINOConfig(OpenVINOConfigWithPast):

@@ -10422,7 +10422,6 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                 value_cache,
                 indexer_cache=None,
                 ple_conv_cache=None,
-                ple_context_cache=None,
                 position_ids_cache=None,
             ):
                 # Call parent constructor with all required arguments
@@ -10447,18 +10446,18 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                         self.linear_attn_mapping[i] = linear_attn_layer_idx
                         linear_attn_layer_idx += 1
 
-                # PLE states (conv_states[1] / [2]) are handled by unpatched model code through `self.layers`
+                # PLE short-conv state (conv_states[1]) is handled by unpatched model code through `self.layers`.
+                # The n-gram hash (conv_states[2] in the non-split layout) is computed by the separate
+                # `ngram_embeddings` model instead, see `qwen4_exp_ple_embeds_passthrough_forward`.
                 has_previous_state = self.get_seq_length() > 0
-                for cache, state_idx in ((ple_conv_cache, 1), (ple_context_cache, 2)):
-                    for layer_idx, value in enumerate(cache or []):
-                        if value is None:
-                            continue
-                        layer = self.layers[layer_idx]
-                        # token-id history is stored as int32, see Qwen4ExpDummyPastKeyValuesGenerator
-                        layer.conv_states[state_idx] = value.to(torch.int64) if state_idx == 2 else value
-                        layer.is_conv_states_initialized[state_idx] = True
-                        layer.has_previous_state[state_idx] = has_previous_state
-                        layer.conv_kernel_size[state_idx] = value.shape[-1]
+                for layer_idx, value in enumerate(ple_conv_cache or []):
+                    if value is None:
+                        continue
+                    layer = self.layers[layer_idx]
+                    layer.conv_states[1] = value
+                    layer.is_conv_states_initialized[1] = True
+                    layer.has_previous_state[1] = has_previous_state
+                    layer.conv_kernel_size[1] = value.shape[-1]
 
                 if position_ids_cache is not None:
                     # (batch, seq, 3) float32 -> native (3, batch, seq) int64
@@ -10530,7 +10529,7 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
             cache_params=None,
             inputs_embeds=None,
             position_ids=None,
-            ple_input_ids=None,
+            ple_embeds=None,
         ):
             text_config = self._text_config
             layer_types = text_config.layer_types
@@ -10567,10 +10566,9 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                     indexer_cache[layer_idx] = cache_params[offset + i]
                 offset += len(qsa_layer_ids)
                 ple_conv_cache = [None] * len(layer_types)
-                ple_context_cache = [None] * len(layer_types)
                 for i, layer_idx in enumerate(ple_layer_ids):
-                    ple_conv_cache[layer_idx] = cache_params[offset + 2 * i]
-                    ple_context_cache[layer_idx] = cache_params[offset + 2 * i + 1]
+                    ple_conv_cache[layer_idx] = cache_params[offset + i]
+                offset += len(ple_layer_ids)
                 position_ids_cache = cache_params[-1] if qsa_layer_ids else None
 
                 wrapped_cache_params = Qwen3_5DynamicCacheWrap(
@@ -10581,11 +10579,19 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                     value_cache,
                     indexer_cache,
                     ple_conv_cache,
-                    ple_context_cache,
                     position_ids_cache,
                 )
 
-            extra_kwargs = {"ple_input_ids": ple_input_ids} if ple_input_ids is not None else {}
+            extra_kwargs = {}
+            if ple_layer_ids:
+                batch_size, seq_len = inputs_embeds.shape[:2]
+                for i, layer_idx in enumerate(ple_layer_ids):
+                    ngram_embedding = self._text_model.layers[layer_idx].ple.ple_embedding
+                    ngram_embedding._qwen4_exp_ple_embeds = ple_embeds[:, :, i].to(inputs_embeds.dtype)
+                # the real token ids are only needed so the reference forward doesn't fall back to the
+                # non-traceable `reverse_embedding`; the hash itself runs in the separate `ngram_embeddings` model.
+                extra_kwargs["ple_input_ids"] = torch.zeros((batch_size, seq_len), dtype=torch.int64)
+
             if self._is_vlm:
                 # VLM case: call language model through the composite model
                 outputs_lm = self._text_model(
@@ -10627,7 +10633,6 @@ class Qwen3_5ModelPatcher(OVDecoderModelPatcher):
                     present_key_values.append(past_kv.indexer_cache[layer_idx])
                 for layer_idx in ple_layer_ids:
                     present_key_values.append(past_kv.layers[layer_idx].conv_states[1])
-                    present_key_values.append(past_kv.layers[layer_idx].conv_states[2].to(torch.int32))
                 if qsa_layer_ids:
                     present_key_values.append(past_kv.position_ids.permute(1, 2, 0).to(torch.float32))
 
@@ -11163,127 +11168,52 @@ def qwen4_exp_traceable_qsa_indexer_forward(
     return selected_token_mask
 
 
-def qwen4_exp_traceable_shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
-    """`Qwen4ExpTextNGramEmbedding._shift_right_ignore_eos` with `torch.cummax` (not convertible) as a masked max."""
-    if shift == 0:
-        return token_ids
-    batch_size, seq_len = token_ids.shape
-    positions = torch.arange(seq_len, device=token_ids.device, dtype=torch.long)
-    eos_positions = torch.where(token_ids == self.eos_token_id, positions, -1)
-    causal = positions.unsqueeze(0) <= positions.unsqueeze(1)  # [i, j] True iff j <= i
-    expanded = eos_positions.unsqueeze(1).expand(batch_size, seq_len, seq_len)  # [b, i, j] = eos_positions[b, j]
-    masked = torch.where(causal.unsqueeze(0), expanded, expanded.new_full((), -1))
-    previous_eos_inclusive = masked.max(dim=-1).values
-    previous_eos = torch.cat([eos_positions.new_full((batch_size, 1), -1), previous_eos_inclusive[:, :-1]], dim=1)
-    segment_start = previous_eos + 1
-    position_in_segment = positions.unsqueeze(0) - segment_start
-    source_positions = positions - shift
-    gather_positions = source_positions.clamp_min(0).unsqueeze(0).expand(batch_size, -1)
-    shifted = token_ids.gather(dim=1, index=gather_positions)
-    valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
-    return torch.where(valid, shifted, token_ids.new_full((), self.eos_token_id))
-
-
-_QWEN4_EXP_HASH_LIMB_BITS = 12
-_QWEN4_EXP_HASH_LIMB_MASK = (1 << _QWEN4_EXP_HASH_LIMB_BITS) - 1
-# token (<= ~18 bits) * 12-bit limb spans at most 3 limbs
-_QWEN4_EXP_HASH_SPREAD_LIMBS = 3
-
-
-def _qwen4_exp_decompose_int_to_limbs(value: int, num_limbs: int) -> list:
-    """Little-endian 12-bit limbs of a python int (computed at patch time, arbitrary precision)."""
-    return [(value >> (_QWEN4_EXP_HASH_LIMB_BITS * i)) & _QWEN4_EXP_HASH_LIMB_MASK for i in range(num_limbs)]
-
-
-def _qwen4_exp_clean_limbs_of_product(token_i32: torch.Tensor, mult_limbs_const: torch.Tensor) -> list:
-    """Exact `token * multiplier` as carry-propagated little-endian 12-bit int32 limbs, all values << 2**31."""
-    num_mult_limbs = mult_limbs_const.shape[0]
-    num_clean_limbs = num_mult_limbs + _QWEN4_EXP_HASH_SPREAD_LIMBS
-    raw = [token_i32 * mult_limbs_const[k] for k in range(num_mult_limbs)]
-    acc = [torch.zeros_like(token_i32) for _ in range(num_clean_limbs)]
-    for k in range(num_mult_limbs):
-        v = raw[k]
-        acc[k] = acc[k] + (v & _QWEN4_EXP_HASH_LIMB_MASK)
-        acc[k + 1] = acc[k + 1] + ((v >> _QWEN4_EXP_HASH_LIMB_BITS) & _QWEN4_EXP_HASH_LIMB_MASK)
-        acc[k + 2] = acc[k + 2] + ((v >> (2 * _QWEN4_EXP_HASH_LIMB_BITS)) & _QWEN4_EXP_HASH_LIMB_MASK)
-    carry = torch.zeros_like(token_i32)
-    clean = []
-    for k in range(num_clean_limbs):
-        total = acc[k] + carry
-        clean.append(total & _QWEN4_EXP_HASH_LIMB_MASK)
-        carry = total >> _QWEN4_EXP_HASH_LIMB_BITS
-    return clean
-
-
-def _qwen4_exp_mod_exact(x: torch.Tensor, modulus: torch.Tensor) -> torch.Tensor:
-    """`x mod modulus` for int32 0 <= x < 2**31: float quotient estimate (off by at most 1), exact int32 correction.
-
-    The CPU plugin computes int32 FloorMod through float, which is inexact above 2**24.
+def qwen4_exp_traceable_ngram_hash_forward(self, ngram_token_ids: torch.Tensor) -> torch.Tensor:
     """
-    q = torch.floor(x.to(torch.float32) / modulus.to(torch.float32)).to(torch.int32)
-    r = x - q * modulus
-    r = r + (r < 0).to(torch.int32) * modulus
-    return r - (r >= modulus).to(torch.int32) * modulus
+    Standalone, cache-free replacement for `Qwen4ExpTextNGramEmbedding.forward`, used by
+    `Qwen4ExpNGramEmbeddingsModule` (one call per PLE layer). Instead of reading/writing the token-history
+    window through an LM `past_key_values` cache, the window is passed directly: `ngram_token_ids` is
+    `[B, context_len + S]`, i.e. the `context_len` tokens preceding the current chunk followed by the `S`
+    tokens of the current chunk.
 
-
-def _qwen4_exp_limbs_mod_primes(limbs: list, weights: torch.Tensor, moduli: torch.Tensor) -> torch.Tensor:
-    """Big integer in 12-bit limbs modulo several primes at once, as `sum_k limb6_k * (2**(6k) mod p) mod p` in int32.
-
-    6-bit limbs keep every product below 2**31 (63 * p, p < 2**25); `weights` is [2 * len(limbs), heads].
+    The int64 multiply/xor/remainder hash and the `torch.cummax` shift are exported as-is: the OV PyTorch FE
+    `aten::cummax` translator and the CPU `NgramHashDecomposition` pass handle them natively.
     """
-    limbs6 = torch.stack([half for limb in limbs for half in (limb & 63, limb >> 6)], dim=-1)  # [B, S, L]
-    terms = _qwen4_exp_mod_exact(limbs6.unsqueeze(-1) * weights, moduli)  # [B, S, L, heads]
-    total = terms[..., 0, :]
-    for k in range(1, terms.shape[-2]):  # explicit Adds: CPU int32 ReduceSum is inexact above 2**24
-        total = total + terms[..., k, :]
-    return _qwen4_exp_mod_exact(total, moduli)
-
-
-def qwen4_exp_traceable_ngram_embedding_forward(self, input_ids: torch.Tensor, past_key_values) -> torch.Tensor:
-    """
-    `Qwen4ExpTextNGramEmbedding.forward` with the int64 multiply/xor/remainder hash computed on small int32 limbs:
-    the CPU plugin silently truncates overflowing int64 Eltwise ops, and Remainder is unreliable for large operands.
-    """
-    input_ids = input_ids.long()
-    # The reference branches on `has_previous_state`, which would be frozen at trace time. Instead the context
-    # is stored offset by -eos_token_id, so the zero-initialized OV state reads back as the eos "no context" default.
-    if past_key_values is not None:
-        previous_context = past_key_values.layers[self.layer_idx].conv_states[2].clone().long() + self.eos_token_id
-        _ = past_key_values.update_conv_state(
-            input_ids - self.eos_token_id, self.layer_idx, state_idx=2, conv_kernel_size=self.context_len
-        )
-    else:
-        previous_context = input_ids.new_full((input_ids.shape[0], self.context_len), self.eos_token_id)
-
-    token_history = torch.cat([previous_context, input_ids], dim=-1)
-    shifted_tokens = [self._shift_right_ignore_eos(token_history, shift) for shift in range(self.ngram_size)]
-
-    limb_lists = [
-        _qwen4_exp_clean_limbs_of_product(
-            shifted_tokens[position].to(torch.int32), self._qwen4_exp_layer_multiplier_limbs[position]
-        )
-        for position in range(self.ngram_size)
-    ]
+    ngram_token_ids = ngram_token_ids.long()
+    seq_len = ngram_token_ids.shape[1] - self.context_len
+    shifted_tokens = [self._shift_right_ignore_eos(ngram_token_ids, shift) for shift in range(self.ngram_size)]
 
     blocks = []
-    for group, ngram in enumerate(range(2, self.ngram_size + 1)):
-        mixed_limbs = limb_lists[0]
+    for ngram in range(2, self.ngram_size + 1):
+        start_idx = (ngram - 2) * self.heads_per_ngram
+        end_idx = start_idx + self.heads_per_ngram
+        mixed_ids = shifted_tokens[0] * self.layer_multipliers[0]
         for position in range(1, ngram):
-            mixed_limbs = [a ^ b for a, b in zip(mixed_limbs, limb_lists[position])]
-        reduced = _qwen4_exp_limbs_mod_primes(
-            mixed_limbs, self._qwen4_exp_mod_weights[group], self._qwen4_exp_moduli[group]
-        )
-        blocks.append(reduced.to(torch.int64) + self._qwen4_exp_head_offsets[group])
+            mixed_ids = torch.bitwise_xor(mixed_ids, shifted_tokens[position] * self.layer_multipliers[position])
+        head_vocab_sizes = self.ngram_heads_vocab_sizes[start_idx:end_idx]
+        head_offsets = self.ngram_heads_offsets[start_idx:end_idx]
+        ngram_ids = torch.remainder(mixed_ids.unsqueeze(-1), head_vocab_sizes.view(1, 1, -1))
+        blocks.append(ngram_ids + head_offsets.view(1, 1, -1))
+    ngram_ids = torch.cat(blocks, dim=-1)[:, -seq_len:]
 
-    ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1] :]
     execution_device = (
         self.ngram_embedding.weight.device if self.ngram_embedding.weight.device.type != "meta" else None
     )
     return self.ngram_embedding(ngram_ids.to(execution_device)).to(ngram_ids.device).flatten(-2)
 
 
+def qwen4_exp_ple_embeds_passthrough_forward(self, input_ids, past_key_values) -> torch.Tensor:
+    """
+    Replaces `Qwen4ExpTextNGramEmbedding.forward` on the language-model side once the n-gram hash + embedding
+    lookup has been split out into the separate `Qwen4ExpNGramEmbeddingsModule`/`ngram_embeddings` OpenVINO
+    model: `input_ids`/`past_key_values` are ignored, and the value precomputed externally and stashed by
+    `Qwen3_5ModelPatcher.patched_forward` (see `ple_embeds`) is returned as-is.
+    """
+    return self._qwen4_exp_ple_embeds
+
+
 class Qwen4ExpModelPatcher(Qwen3_5MoeModelPatcher):
-    """Qwen3.5-MoE patching plus traceable QSA indexer and PLE n-gram embedding replacements."""
+    """Qwen3.5-MoE patching plus traceable QSA indexer and PLE embeds passthrough (see `qwen4_exp_ple_embeds_passthrough_forward`)."""
 
     def __enter__(self):
         from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextSparseMoeBlock
@@ -11299,33 +11229,9 @@ class Qwen4ExpModelPatcher(Qwen3_5MoeModelPatcher):
                 indexer.forward = types.MethodType(qwen4_exp_traceable_qsa_indexer_forward, indexer)
             if getattr(decoder_layer, "ple", None) is not None:
                 ngram_embedding = decoder_layer.ple.ple_embedding
-                multipliers = ngram_embedding.layer_multipliers.tolist()
-                num_mult_limbs = max(1, -(-max(multipliers).bit_length() // _QWEN4_EXP_HASH_LIMB_BITS))
-                ngram_embedding._qwen4_exp_layer_multiplier_limbs = torch.tensor(
-                    [_qwen4_exp_decompose_int_to_limbs(m, num_mult_limbs) for m in multipliers], dtype=torch.int32
-                )
-                num_limbs6 = 2 * (num_mult_limbs + _QWEN4_EXP_HASH_SPREAD_LIMBS)
-                moduli = ngram_embedding.ngram_heads_vocab_sizes.tolist()
-                assert 63 * max(moduli) < 2**31, "n-gram head vocab sizes too large for the int32 modular hash"
-                heads = ngram_embedding.heads_per_ngram
-                groups = [range(g * heads, (g + 1) * heads) for g in range(ngram_embedding.ngram_size - 1)]
-                ngram_embedding._qwen4_exp_mod_weights = [
-                    torch.tensor([[pow(2, 6 * k, moduli[h]) for h in group] for k in range(num_limbs6)], dtype=torch.int32)
-                    for group in groups
-                ]
-                ngram_embedding._qwen4_exp_moduli = [
-                    torch.tensor([moduli[h] for h in group], dtype=torch.int32) for group in groups
-                ]
-                ngram_embedding._qwen4_exp_head_offsets = [
-                    ngram_embedding.ngram_heads_offsets[group.start : group.stop] for group in groups
-                ]
-                ngram_embedding._orig_shift_right_ignore_eos = ngram_embedding._shift_right_ignore_eos
-                ngram_embedding._shift_right_ignore_eos = types.MethodType(
-                    qwen4_exp_traceable_shift_right_ignore_eos, ngram_embedding
-                )
                 ngram_embedding._orig_forward = ngram_embedding.forward
                 ngram_embedding.forward = types.MethodType(
-                    qwen4_exp_traceable_ngram_embedding_forward, ngram_embedding
+                    qwen4_exp_ple_embeds_passthrough_forward, ngram_embedding
                 )
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -11339,9 +11245,72 @@ class Qwen4ExpModelPatcher(Qwen3_5MoeModelPatcher):
                 indexer.forward = indexer._orig_forward
             if getattr(decoder_layer, "ple", None) is not None:
                 ngram_embedding = decoder_layer.ple.ple_embedding
-                ngram_embedding._shift_right_ignore_eos = ngram_embedding._orig_shift_right_ignore_eos
                 ngram_embedding.forward = ngram_embedding._orig_forward
         super().__exit__(exc_type, exc_value, traceback)
+
+
+class Qwen4ExpNGramEmbeddingsModule(nn.Module):
+    """
+    Standalone PyTorch module wrapping the PLE n-gram hash + embedding-table lookups of all qwen4_exp PLE
+    layers, for independent, stateless OpenVINO export.
+
+    Unlike `Qwen4ExpTextNGramEmbedding.forward`, which reads/writes the token-history window through the LM's
+    `past_key_values` cache, this module takes the window as an explicit input (`ngram_token_ids`) and holds
+    no state of its own: the caller (`OVQwen4ExpNGramEmbeddings`) is responsible for keeping track of the
+    token history and building that window on every call.
+    """
+
+    __module__ = "transformers.models.qwen4_exp"
+
+    def __init__(self, text_config):
+        super().__init__()
+        self.config = copy.deepcopy(text_config)
+        self.ngram_embeddings = nn.ModuleList()
+
+    @classmethod
+    def from_pretrained_model(cls, model):
+        """Create the n-gram embeddings module, reusing (not copying) the PLE embedding tables of `model`."""
+        config = model.config
+        text_config = getattr(config, "text_config", config)
+        module = cls(text_config)
+
+        text_model = getattr(model.model, "language_model", model.model)
+        ple_layers = [
+            decoder_layer.ple
+            for decoder_layer in text_model.layers
+            if getattr(decoder_layer, "ple", None) is not None
+        ]
+        ple_layers.sort(key=lambda ple_layer: ple_layer.ple_embedding.ple_layer_index)
+        for ple_layer in ple_layers:
+            ngram_embedding = ple_layer.ple_embedding
+            ngram_embedding._orig_forward = ngram_embedding.forward
+            ngram_embedding.forward = types.MethodType(qwen4_exp_traceable_ngram_hash_forward, ngram_embedding)
+            module.ngram_embeddings.append(ngram_embedding)
+        return module
+
+    def forward(self, ngram_token_ids: torch.Tensor) -> torch.Tensor:
+        return torch.stack([ngram_embedding(ngram_token_ids) for ngram_embedding in self.ngram_embeddings], dim=2)
+
+
+class Qwen4ExpNGramEmbeddingsPatcher(ModelPatcher):
+    """Patcher for the standalone PLE n-gram hash + embedding module, see `Qwen4ExpNGramEmbeddingsModule`."""
+
+    def __init__(
+        self,
+        config: "OpenVINOConfig",
+        model: "PreTrainedModel",
+        model_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(config, model, model_kwargs)
+        # Drive the module's own forward directly and bypass the base `ModelPatcher` cache pre/post-processing,
+        # which assumes a standard decoder `past_key_values` interface this stateless module doesn't have.
+        module_forward = self._model.forward
+
+        def patched_forward(ngram_token_ids):
+            return {"ple_embeds": module_forward(ngram_token_ids)}
+
+        self.patched_forward = patched_forward
+        self.orig_forward = self._model.forward
 
 
 class Qwen3_5MoeMTPModule(nn.Module):
