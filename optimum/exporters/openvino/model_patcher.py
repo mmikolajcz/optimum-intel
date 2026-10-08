@@ -11175,13 +11175,16 @@ def qwen4_exp_traceable_ngram_hash_forward(self, ngram_token_ids: torch.Tensor) 
     window through an LM `past_key_values` cache, the window is passed directly: `ngram_token_ids` is
     `[B, context_len + S]`, i.e. the `context_len` tokens preceding the current chunk followed by the `S`
     tokens of the current chunk.
-
-    The int64 multiply/xor/remainder hash and the `torch.cummax` shift are exported as-is: the OV PyTorch FE
-    `aten::cummax` translator and the CPU `NgramHashDecomposition` pass handle them natively.
     """
     ngram_token_ids = ngram_token_ids.long()
     seq_len = ngram_token_ids.shape[1] - self.context_len
-    shifted_tokens = [self._shift_right_ignore_eos(ngram_token_ids, shift) for shift in range(self.ngram_size)]
+    eos = ngram_token_ids.new_full((), self.eos_token_id)
+    shifted_tokens = [ngram_token_ids]
+    cut = torch.zeros_like(ngram_token_ids, dtype=torch.bool)
+    for shift in range(1, self.ngram_size):
+        previous = torch.cat([eos.expand(ngram_token_ids.shape[0], shift), ngram_token_ids[:, :-shift]], dim=1)
+        cut = cut | (previous == eos)
+        shifted_tokens.append(torch.where(cut, eos, previous))
 
     blocks = []
     for ngram in range(2, self.ngram_size + 1):
