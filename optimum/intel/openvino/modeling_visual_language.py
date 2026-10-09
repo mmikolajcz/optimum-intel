@@ -458,11 +458,12 @@ class OVQwen4ExpNGramEmbeddings(OVModelPart):
 
     def result(self) -> torch.Tensor:
         self._infer_request.wait()
-        return torch.from_numpy(self._infer_request.get_tensor("ple_embeds").data).clone()
+        # A view of the request's output buffer: valid until the next start(), which overwrites it.
+        return torch.from_numpy(self._infer_request.get_tensor("ple_embeds").data)
 
     def forward(self, ngram_token_ids: torch.Tensor) -> torch.Tensor:
         self.start(ngram_token_ids)
-        return self.result()
+        return self.result().clone()
 
 
 class OVAudioEmbeddings(OVModelPart):
@@ -8036,6 +8037,7 @@ class OVModelWithEmbedForQwen4ExpCausalLM(Qwen4ExpExternalCacheMixin, OVModelWit
                 ids = ple_input_ids if ple_input_ids is not None else input_ids
                 self._ngram_start(ids, kwargs.get("attention_mask"), new_sequence=past_key_values is None)
             self._ngram_pending = False
+            # The language model consumes it within this step, before the n-gram request runs again.
             kwargs["ple_embeds"] = self._ngram_part.result()
 
         inputs = super().prepare_inputs(
