@@ -1240,6 +1240,55 @@ class DummyMiniCPMVImageInputGenerator(DummyVisionInputGenerator):
             )
 
 
+class DummyMiniCPMV4_7VisionInputGenerator(DummyVisionInputGenerator):
+    """
+    Dummy inputs for the per-crop MiniCPM-V 4.7 vision graph: the NaViT-packed patches of one crop plus the host-side
+    index tensors (position embedding ids, 2x2 window order for the ViT merger and 2x2 order for the final merger).
+    """
+
+    SUPPORTED_INPUT_NAMES = ("pixel_values", "position_ids", "window_index", "merge_index")
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedVisionConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        num_channels: int = DEFAULT_DUMMY_SHAPES["num_channels"],
+        width: int = DEFAULT_DUMMY_SHAPES["width"],
+        height: int = DEFAULT_DUMMY_SHAPES["height"],
+        **kwargs,
+    ):
+        super().__init__(task, normalized_config, batch_size, num_channels, width, height)
+        config = normalized_config.config
+        self.patch_size = config.patch_size
+        self.num_positions = (config.image_size // config.patch_size) ** 2
+        # crop grid in patches, both sides divisible by 4 (2x2 window merge followed by 2x2 merge)
+        self.grid_height = max(4, self.height // self.patch_size // 4 * 4)
+        self.grid_width = max(4, self.width // self.patch_size // 4 * 4)
+
+    @staticmethod
+    def _block_order(height: int, width: int) -> torch.Tensor:
+        # row-major token indices regrouped so that every 2x2 block is contiguous
+        return torch.arange(height * width).view(height // 2, 2, width // 2, 2).permute(0, 2, 1, 3).reshape(-1)
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        num_patches = self.grid_height * self.grid_width
+        if input_name == "pixel_values":
+            return self.random_float_tensor(
+                shape=[1, self.num_channels, self.patch_size, num_patches * self.patch_size],
+                framework=framework,
+                dtype=float_dtype,
+            )
+        if input_name == "position_ids":
+            return self.random_int_tensor(
+                shape=[num_patches], max_value=self.num_positions, framework=framework, dtype=int_dtype
+            )
+        if input_name == "window_index":
+            return self._block_order(self.grid_height, self.grid_width)
+        if input_name == "merge_index":
+            return self._block_order(self.grid_height // 2, self.grid_width // 2)
+
+
 class DummyMiniCPMVResampleInputGenerator(DummyVisionInputGenerator):
     SUPPORTED_INPUT_NAMES = ("image_feature", "pos_embed", "key_padding_mask")
 
@@ -1449,6 +1498,24 @@ class DummyQwen2VLLMInputGenerator(DummyTextInputGenerator):
         return generated_input
 
 
+class DummyMiniCPMV4_7LMInputGenerator(DummyQwen2VLLMInputGenerator):
+    """
+    (3, batch, seq) M-RoPE `position_ids` and an `attention_mask` that covers the past and the current tokens, the past
+    length being the dummy cache length (`sequence_length`) produced by `Qwen3_5DummyPastKeyValuesGenerator`.
+    """
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "attention_mask":
+            return self.random_int_tensor(
+                shape=[self.batch_size, 2 * self.sequence_length],
+                min_value=1,
+                max_value=2,
+                framework=framework,
+                dtype=int_dtype,
+            )
+        return super().generate(input_name, framework, int_dtype, float_dtype)
+
+
 class DummyQwen3_5LMInputGenerator(DummyTextInputGenerator):
     def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
         generated_input = super().generate(input_name, framework, int_dtype, float_dtype)
@@ -1607,6 +1674,34 @@ class FunASRDummyAudioInputGenerator(DummyAudioInputGenerator):
                 max_value=1,
                 framework=framework,
                 dtype=float_dtype,
+            )
+        return super().generate(input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype)
+
+
+class SenseVoiceDummyInputGenerator(FunASRDummyAudioInputGenerator):
+    """Dummy input generator for SenseVoiceSmall (CTC).
+
+    SenseVoiceSmall consumes fbank features laid out as (batch, num_frames, feature_size) plus the per-sample
+    valid frame counts (`speech_lengths`) and two integer prefix-query selectors (`language`, `textnorm`)
+    that index a small learned embedding table.
+    """
+
+    SUPPORTED_INPUT_NAMES = ("input_features", "speech_lengths", "language", "textnorm")
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name == "speech_lengths":
+            # Valid frame count per sample; use the full (padded) frame count so the traced mask is all-ones.
+            return self.random_int_tensor(
+                shape=[self.batch_size],
+                max_value=self.nb_max_frames + 1,
+                min_value=self.nb_max_frames,
+                framework=framework,
+                dtype=int_dtype,
+            )
+        if input_name in ("language", "textnorm"):
+            # Any valid embedding index works for tracing; use 0 (== "auto" language).
+            return self.random_int_tensor(
+                shape=[self.batch_size], max_value=1, min_value=0, framework=framework, dtype=int_dtype
             )
         return super().generate(input_name, framework=framework, int_dtype=int_dtype, float_dtype=float_dtype)
 
@@ -2924,7 +3019,8 @@ class Qwen4ExpDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
     """
     Dummy `cache_params` of the Qwen3.8-Flash-Next language model, in the order of
     `Qwen4ExpTextOpenVINOConfig.add_past_key_values`: [conv, ssm] per Gated DeltaNet layer, [key, value] per QSA layer,
-    the raw index keys per QSA layer, the PLE short conv state per PLE layer and the M-RoPE positions of past tokens.
+    the raw index keys per QSA layer, the block index keys per QSA layer, the PLE short conv state per PLE layer and
+    the M-RoPE positions of past tokens.
     """
 
     SUPPORTED_INPUT_NAMES = ("cache_params",)
@@ -2977,6 +3073,9 @@ class Qwen4ExpDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
             cache_params += [random_float(kv_shape), random_float(kv_shape)]
         for _ in range(num_qsa):
             cache_params.append(random_float((self.batch_size, self.sequence_length, config.indexer_head_dim)))
+        num_blocks = self.sequence_length // config.indexer_compress_ratio
+        for _ in range(num_qsa):
+            cache_params.append(random_float((self.batch_size, num_blocks, config.indexer_head_dim)))
         ple_conv_state_len = (config.ple_conv_kernel_size - 1) * config.ngram_size
         for _ in range(num_ple):
             cache_params.append(
@@ -2984,4 +3083,63 @@ class Qwen4ExpDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
             )
         rope_positions = torch.arange(self.sequence_length, dtype=DTYPE_MAPPER.pt(float_dtype))
         cache_params.append(rope_positions.view(1, -1, 1).expand(self.batch_size, -1, 3).contiguous())
+        return cache_params
+
+
+class Qwen4ExpMTPDummyInputGenerator(DummyInputGenerator):
+    """
+    Dummy inputs of the Qwen3.8-Flash-Next MTP head: the hyper-connection streams of the main model `hidden_states`
+    [batch, sequence, hc_count * hidden], `inputs_embeds`, `attention_mask` over the past and the current tokens,
+    4D `position_ids` and `cache_params` in the order of `Qwen4ExpMTPOpenVINOConfig.add_past_key_values`:
+    [key, value] per layer, the raw index keys per layer, the block index keys per layer, the M-RoPE positions.
+    """
+
+    SUPPORTED_INPUT_NAMES = ("hidden_states", "inputs_embeds", "attention_mask", "position_ids", "cache_params")
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedTextConfig,
+        batch_size: int = DEFAULT_DUMMY_SHAPES["batch_size"],
+        sequence_length: int = DEFAULT_DUMMY_SHAPES["sequence_length"],
+        **kwargs,
+    ):
+        self.task = task
+        self.batch_size = batch_size
+        self.sequence_length = sequence_length
+        self.past_sequence_length = sequence_length
+        self.config = normalized_config.config
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        config = self.config
+        batch, seq, past = self.batch_size, self.sequence_length, self.past_sequence_length
+        hidden_size = config.hidden_size
+
+        def random_float(shape):
+            return self.random_float_tensor(shape, framework=framework, dtype=float_dtype)
+
+        if input_name == "hidden_states":
+            return random_float((batch, seq, config.hc_count * hidden_size))
+        if input_name == "inputs_embeds":
+            return random_float((batch, seq, hidden_size))
+        if input_name == "attention_mask":
+            return self.random_int_tensor(
+                (batch, past + seq), min_value=1, max_value=2, framework=framework, dtype=int_dtype
+            )
+        if input_name == "position_ids":
+            position_ids = torch.arange(past, past + seq, dtype=DTYPE_MAPPER.pt(int_dtype))
+            return position_ids.view(1, 1, -1).expand(4, batch, -1).contiguous()
+
+        num_layers = config.mtp_num_hidden_layers
+        head_dim = getattr(config, "head_dim", None) or hidden_size // config.num_attention_heads
+        cache_params = []
+        for _ in range(num_layers):
+            kv_shape = (batch, config.num_key_value_heads, past, head_dim)
+            cache_params += [random_float(kv_shape), random_float(kv_shape)]
+        for _ in range(num_layers):
+            cache_params.append(random_float((batch, past, config.indexer_head_dim)))
+        for _ in range(num_layers):
+            cache_params.append(random_float((batch, past // config.indexer_compress_ratio, config.indexer_head_dim)))
+        rope_positions = torch.arange(past, dtype=DTYPE_MAPPER.pt(float_dtype))
+        cache_params.append(rope_positions.view(1, -1, 1).expand(batch, -1, 3).contiguous())
         return cache_params
